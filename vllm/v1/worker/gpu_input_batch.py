@@ -22,6 +22,7 @@ from vllm.v1.sample.logits_processor import (
     MoveDirectionality,
 )
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.ops.powerlaw_sampler import PowerLawSampler
 from vllm.v1.spec_decode.utils import is_spec_decode_unsupported
 from vllm.v1.utils import copy_slice
 from vllm.v1.worker.block_table import MultiGroupBlockTable
@@ -256,6 +257,14 @@ class InputBatch:
 
         # Store last speculative tokens for sampler.
         self.spec_token_ids: list[list[int]] = [[] for _ in range(max_num_reqs)]
+
+        # Stateful sampling ops that must persist across decoding steps.
+        # This is used by the post-topk power-law sampler to preserve adaptive
+        # history even when requests move within the persistent batch.
+        self.powerlaw_sampler = PowerLawSampler(
+            vllm_config=None,  # type: ignore[arg-type]
+            device=self.device,
+        )
 
         # This is updated each time the batch constituents change.
         self.sampling_metadata = self._make_sampling_metadata()
@@ -749,6 +758,11 @@ class InputBatch:
         batch_update = self.batch_update_builder.get_and_reset(self.num_reqs)
         for logit_proc in self.logitsprocs.all:
             logit_proc.update_state(batch_update)
+
+        # Keep stateful sampling ops (e.g. power-law sampler) in sync with the
+        # persistent batch so moved requests preserve adaptive history.
+        if batch_update is not None:
+            self.powerlaw_sampler.update_state(batch_update)
         if batch_update:
             self.sampling_metadata = self._make_sampling_metadata()
 
@@ -834,6 +848,7 @@ class InputBatch:
             allowed_token_ids_mask=allowed_token_ids_mask,
             bad_words_token_ids=self.bad_words_token_ids,
             logitsprocs=self.logitsprocs,
+            powerlaw_sampler=self.powerlaw_sampler,
         )
 
     def get_pooling_params(self) -> list[PoolingParams]:

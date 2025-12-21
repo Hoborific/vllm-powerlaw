@@ -40,5 +40,8 @@ class SamplingMetadata:
     # Loaded logits processors
     logitsprocs: LogitsProcessors
 
+    # stateful for adaptive history
+    powerlaw_sampler: object | None = None
+
     # Speculative token ids
     spec_token_ids: list[list[int]] | None = None

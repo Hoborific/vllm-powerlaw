@@ -13,6 +13,7 @@ from vllm.v1.sample.ops.bad_words import apply_bad_words
 from vllm.v1.sample.ops.logprobs import batched_count_greater_than
 from vllm.v1.sample.ops.penalties import apply_all_penalties
 from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler
+from vllm.v1.sample.ops.powerlaw_sampler import PowerLawSampler
 
 _SAMPLING_EPS = 1e-5
 
@@ -63,6 +64,7 @@ class Sampler(nn.Module):
         self.topk_topp_sampler = TopKTopPSampler(logprobs_mode)
         self.pin_memory = is_pin_memory_available()
         self.logprobs_mode = logprobs_mode
+        self.powerlaw_sampler: PowerLawSampler | None = None
 
     def forward(
         self,
@@ -182,14 +184,54 @@ class Sampler(nn.Module):
         # (argmax invariant)
         for processor in sampling_metadata.logitsprocs.argmax_invariant:
             logits = processor.apply(logits)
+        
+    # Power-law sampling is implemented as a stateful sampler.
+    # Only bypass the platform-optimized TopK/TopP samplers when PowerLaw
+    # is actually enabled for at least one request in the batch.
+    # (this is needed in case of flashinfer/aiter)
+        powerlaw_sampler = sampling_metadata.powerlaw_sampler
+        if powerlaw_sampler is None:
+            # Fallback for older/alternate callers that don't provide
+            # stateful ops via SamplingMetadata.
+            if self.powerlaw_sampler is None:
+                self.powerlaw_sampler = PowerLawSampler(
+                    vllm_config=None,  # type: ignore[arg-type]
+                    device=logits.device,
+                )
+            powerlaw_sampler = self.powerlaw_sampler
 
-        # Apply top_k and/or top_p.
-        random_sampled, processed_logprobs = self.topk_topp_sampler(
-            logits,
-            sampling_metadata.generators,
-            sampling_metadata.top_k,
-            sampling_metadata.top_p,
+        use_powerlaw = bool(
+            powerlaw_sampler is not None
+            and getattr(powerlaw_sampler, "enabled", None) is not None
+            and powerlaw_sampler.enabled()
         )
+
+        if use_powerlaw:
+            # PowerLaw path: apply top-k/top-p masks first, then delegate token
+            # selection to the stateful sampler so it can update per-request
+            # history based on the chosen token.
+            # Apply top-k/top-p masks only (in-place).
+            logits = self.topk_topp_sampler.apply_top_k_top_p(
+                logits, sampling_metadata.top_k, sampling_metadata.top_p
+            )
+
+            random_sampled = powerlaw_sampler.sample(
+                logits, sampling_metadata.generators
+            )
+
+            processed_logprobs = None
+            if sampling_metadata.max_num_logprobs is not None:
+                if logprobs_mode == "processed_logits":
+                    processed_logprobs = logits
+                elif logprobs_mode == "processed_logprobs":
+                    processed_logprobs = self.compute_logprobs(logits)
+        else:
+            random_sampled, processed_logprobs = self.topk_topp_sampler(
+                logits,
+                sampling_metadata.generators,
+                sampling_metadata.top_k,
+                sampling_metadata.top_p,
+            )
 
         if greedy_sampled is None:
             return random_sampled, processed_logprobs
